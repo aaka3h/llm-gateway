@@ -1,94 +1,105 @@
-import os
-import subprocess
-import time
-import sys
-import requests
-import json
-import gradio as gr
+import logging
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import ollama
 
-def check_dependencies():
-    """Ensure Ollama is installed before starting."""
-    if subprocess.call(["which", "ollama"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
-        print("ERROR: Ollama is not installed on this system.")
-        print("Please install it first using: curl -fsSL https://ollama.com/install.sh | sh")
-        sys.exit(1)
+# 1. Setup Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def start_ollama():
-    """Boot up the Ollama background service."""
-    print("Starting Ollama background service...")
-    # Inherit system environment variables (important for GPU pathways)
-    env = os.environ.copy()
-    subprocess.Popen(["ollama", "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(5) 
+# 2. Initialize the API
+app = FastAPI(title="Advanced Local MoE Gateway")
 
-def pull_required_models():
-    """Ensure the A-Team models are downloaded."""
-    models = ["llama3.2:1b", "llama3.2", "qwen2.5-coder:7b"]
-    for model in models:
-        print(f"Checking/Downloading {model}...")
-        subprocess.run(["ollama", "pull", model], stdout=subprocess.DEVNULL)
-    print("All models verified and loaded!")
+# 3. Configure CORS (Crucial for your Netlify frontend)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def determine_best_model(prompt):
-    """Level 2 Supervisor AI Router logic."""
-    system_instruction = """
-    You are an intelligent routing AI. Read the user's prompt. 
-    If the prompt asks for programming, coding, scripts, debugging, or web development, output exactly the word: CODE
-    If it is a general question, output exactly the word: CHAT
-    Do not output any other words or punctuation.
+# 4. Define the Data Structure
+class UserInput(BaseModel):
+    prompt: str
+
+# 5. The Advanced Supervisor Logic
+def classify_intent(prompt: str) -> str:
+    """Uses a fast model to classify the prompt into multiple specific domains."""
+    
+    supervisor_prompt = f"""
+    You are an intelligent router. Analyze the user's prompt and classify it into EXACTLY ONE of these categories:
+    
+    1. 'linux' - For questions about Linux, bash commands, terminal, or operating systems.
+    2. 'code' - For programming, scripts, debugging, or web development.
+    3. 'complex' - For deep logic, long essays, or complex reasoning.
+    4. 'casual' - For simple greetings, quick facts, or casual conversation.
+    
+    Respond ONLY with the single category word. Do not explain yourself.
+    
+    User Prompt: "{prompt}"
     """
-    try:
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "llama3.2:1b",
-                "prompt": prompt,
-                "system": system_instruction,
-                "stream": False
-            },
-            timeout=10
-        )
-        supervisor_decision = response.json().get("response", "").strip().upper()
-    except Exception:
-        # Fallback to generalist if supervisor API fails
-        return "llama3.2"
-    
-    if "CODE" in supervisor_decision:
-        return "qwen2.5-coder:7b"
-    return "llama3.2"
-
-def chat_with_ollama(message, history):
-    target_model = determine_best_model(message)
-    
-    messages = []
-    for user_msg, bot_msg in history:
-        messages.append({"role": "user", "content": user_msg})
-        messages.append({"role": "assistant", "content": bot_msg})
-    messages.append({"role": "user", "content": message})
-    
-    yield f"*(Supervisor routed to **{target_model}**)*\n\n"
     
     try:
-        response = requests.post(
-            "http://localhost:11434/api/chat",
-            json={"model": target_model, "messages": messages, "stream": True},
-            stream=True
-        )
+        # Using llama3.2 as the ultra-fast dispatcher
+        response = ollama.chat(model='llama3.2:latest', messages=[
+            {'role': 'user', 'content': supervisor_prompt}
+        ])
         
-        partial_message = f"*(Supervisor routed to **{target_model}**)*\n\n"
-        for line in response.iter_lines():
-            if line:
-                data = json.loads(line)
-                partial_message += data["message"]["content"]
-                yield partial_message
+        category = response['message']['content'].strip().lower()
+        
+        # Clean up the response to ensure it matches our exact routing keys
+        valid_categories = ["linux", "code", "complex", "casual"]
+        for valid in valid_categories:
+            if valid in category:
+                return valid
+                
+        return "casual" # Safe fallback if the model gets confused
+        
     except Exception as e:
-        yield f"An error occurred while communicating with the engine: {str(e)}"
+        logging.error(f"Supervisor classification failed: {e}")
+        return "casual"
 
-if __name__ == "__main__":
-    check_dependencies()
-    start_ollama()
-    pull_required_models()
+# 6. The Main Chat Endpoint
+@app.post("/chat")
+async def chat_endpoint(user_input: UserInput):
+    """Receives prompt, routes to the best expert, and returns the answer."""
+    prompt = user_input.prompt
     
-    print("Launching Gradio public interface...")
-    # share=True creates a temporary public share link automatically
-    gr.ChatInterface(chat_with_ollama, title="Level 2 AI: Intelligent Supervisor Router").launch(share=True)
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+
+    # Step A: Classify the intent secretly in the background
+    category = classify_intent(prompt)
+    logging.info(f"Supervisor classified prompt as: '{category}'")
+
+    # Step B: Map the category to your specific installed models
+    model_roster = {
+        "linux": "linuxpal:latest",
+        "code": "deepseek-coder-v2:16b", 
+        "complex": "llama3.1:8b",        
+        "casual": "shadow-ai:latest"     
+    }
+
+    # Grab the right model, defaulting to shadow-ai if something goes wrong
+    specialist_model = model_roster.get(category, "shadow-ai:latest")
+
+    logging.info(f"Routing to specialist model: {specialist_model}...")
+
+    # Step C: Generate the final answer using the chosen expert
+    try:
+        response = ollama.chat(model=specialist_model, messages=[
+            {'role': 'user', 'content': prompt}
+        ])
+        
+        answer = response['message']['content']
+        
+        # Send both the answer and the exact model name back to the frontend
+        return {
+            "model_used": specialist_model,
+            "response": answer
+        }
+        
+    except Exception as e:
+        logging.error(f"Specialist model failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate response from the LLM.")
